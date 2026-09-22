@@ -1,0 +1,2 @@
+"""Vector store implementation placeholder."""
+
