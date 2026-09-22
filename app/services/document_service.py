@@ -1,9 +1,11 @@
 """PDF validation and text extraction services."""
 
 from pathlib import Path
+from uuid import uuid4
 
 import pymupdf
 
+from app.rag.chunking import chunk_text
 from app.schemas.document import DocumentUploadResponse
 
 PDF_CONTENT_TYPES = frozenset({"application/pdf", "application/x-pdf"})
@@ -25,6 +27,8 @@ def process_pdf_document(
     content_type: str | None,
     content: bytes,
     preview_character_limit: int,
+    chunk_size: int,
+    chunk_overlap: int,
 ) -> DocumentUploadResponse:
     """Validate a PDF upload and return its extracted text summary."""
     validated_filename = _validate_pdf_upload(
@@ -49,11 +53,20 @@ def process_pdf_document(
             "The uploaded file is not a readable PDF."
         ) from exc
 
+    chunks = chunk_text(
+        extracted_text,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+    )
+
     return DocumentUploadResponse(
+        document_id=uuid4(),
         filename=validated_filename,
         page_count=page_count,
         character_count=len(extracted_text),
         preview=_build_preview(extracted_text, preview_character_limit),
+        chunk_count=len(chunks),
+        chunks=chunks,
     )
 
 
@@ -88,4 +101,3 @@ def _build_preview(text: str, character_limit: int) -> str:
     """Create a compact, whitespace-normalized text preview."""
     normalized_text = " ".join(text.split())
     return normalized_text[:character_limit]
-

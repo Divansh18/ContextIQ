@@ -9,7 +9,9 @@ description = "A lightweight RAG knowledge assistant."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "elasticsearch>=9.0,<10.0",
     "fastapi>=0.115,<1.0",
+    "openai>=1.0,<3.0",
     "pydantic-settings>=2.6,<3.0",
     "pymupdf>=1.24,<2.0",
     "python-multipart>=0.0.12,<1.0",
@@ -28,4 +30,3 @@ include = ["app*"]
 [tool.pytest.ini_options]
 addopts = "-ra"
 testpaths = ["tests"]
-

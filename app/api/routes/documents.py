@@ -2,14 +2,19 @@
 
 from typing import Annotated
 
-from fastapi import APIRouter, File, HTTPException, UploadFile, status
+from elasticsearch import Elasticsearch
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from starlette.concurrency import run_in_threadpool
 
 from app.core.config import get_settings
+from app.core.elasticsearch import get_elasticsearch_client
+from app.rag.embeddings import EmbeddingError, MissingOpenAIAPIKeyError
+from app.rag.vector_store import IncompatibleIndexMappingError, VectorStoreError
 from app.schemas.document import DocumentUploadResponse
+from app.services.document_ingestion_service import ingest_pdf_document
 from app.services.document_service import (
     DocumentProcessingError,
     UnsupportedDocumentTypeError,
-    process_pdf_document,
 )
 
 router = APIRouter(prefix="/documents", tags=["documents"])
@@ -22,15 +27,23 @@ router = APIRouter(prefix="/documents", tags=["documents"])
 )
 async def upload_document(
     file: Annotated[UploadFile, File(description="The PDF document to process")],
+    elasticsearch_client: Annotated[
+        Elasticsearch,
+        Depends(get_elasticsearch_client),
+    ],
 ) -> DocumentUploadResponse:
-    """Validate and extract summary information from one uploaded PDF."""
+    """Process, embed, and index one uploaded PDF."""
+    settings = get_settings()
+
     try:
         content = await file.read()
-        return process_pdf_document(
+        return await run_in_threadpool(
+            ingest_pdf_document,
             filename=file.filename,
             content_type=file.content_type,
             content=content,
-            preview_character_limit=get_settings().preview_character_limit,
+            settings=settings,
+            elasticsearch_client=elasticsearch_client,
         )
     except UnsupportedDocumentTypeError as exc:
         raise HTTPException(
@@ -40,6 +53,26 @@ async def upload_document(
     except DocumentProcessingError as exc:
         raise HTTPException(
             status_code=422,
+            detail=str(exc),
+        ) from exc
+    except MissingOpenAIAPIKeyError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        ) from exc
+    except IncompatibleIndexMappingError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+    except EmbeddingError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=str(exc),
+        ) from exc
+    except VectorStoreError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=str(exc),
         ) from exc
     finally:

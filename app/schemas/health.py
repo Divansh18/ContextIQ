@@ -11,3 +11,10 @@ class HealthResponse(BaseModel):
     status: Literal["ok"]
     service: str
 
+
+class ReadinessResponse(BaseModel):
+    """Application dependency readiness response."""
+
+    status: Literal["ready", "not_ready"]
+    service: str
+    elasticsearch: Literal["ok", "unavailable"]
