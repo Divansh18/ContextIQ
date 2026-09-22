@@ -9,6 +9,7 @@ from app.rag.generation import (
     INSUFFICIENT_CONTEXT_ANSWER,
     build_retrieved_context,
     generate_grounded_answer,
+    to_langchain_documents,
 )
 from app.rag.retriever import retrieve_semantic_chunks
 from app.schemas.answer import AnswerSource, AskResponse
@@ -44,7 +45,8 @@ def answer_question(
         )
         for chunk in context_chunks
     ]
-    context = build_retrieved_context(context_chunks)
+    context_documents = to_langchain_documents(context_chunks)
+    context = build_retrieved_context(context_documents)
     if not context:
         return AskResponse(
             question=normalized_question,

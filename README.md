@@ -16,13 +16,15 @@ FastAPI.
 - Batched OpenAI embeddings with `text-embedding-3-small`
 - Bulk indexing of embedded chunks into Elasticsearch
 - Semantic vector search across all documents or within one document
-- Grounded answer generation with retrieved source metadata
+- Grounded answer generation with retrieved source metadata and a focused
+  LangChain LCEL pipeline
 - Separate application liveness and Elasticsearch readiness checks
 - Environment-backed application configuration
 - API tests
 
-LangChain, LangGraph, authentication, and a frontend are intentionally deferred
-to later milestones.
+LangGraph, authentication, and a frontend are intentionally deferred to later
+milestones. LangChain is used only at the answer-generation boundary described
+below; ingestion, indexing, and retrieval remain explicit application code.
 
 ## Architecture
 
@@ -63,11 +65,13 @@ The grounded answer flow builds directly on semantic search:
 ```text
 POST /ask
   -> question service
-  -> semantic retriever
-  -> ranked document chunks
-  -> deterministic context construction
-  -> OpenAI Responses API
-  -> answer plus source metadata
+  -> semantic retriever                         (ContextIQ)
+  -> ranked document chunks                     (ContextIQ)
+  -> LangChain Document adapter + source blocks (ContextIQ)
+  -> ChatPromptTemplate                         (LangChain)
+  -> ChatOpenAI via the Responses API           (LangChain)
+  -> StrOutputParser                            (LangChain)
+  -> answer plus source metadata                (ContextIQ)
 ```
 
 ## Requirements
@@ -218,8 +222,9 @@ RAG has three direct stages in ContextIQ:
 2. **Augmentation:** ContextIQ formats those chunks into deterministic,
    clearly delimited `[SOURCE n]` blocks containing document metadata, retrieval
    score, and source text.
-3. **Generation:** the question and source blocks are sent to OpenAI's Responses
-   API with internal instructions to answer only from that context.
+3. **Generation:** a focused LangChain pipeline sends the question and source
+   blocks to OpenAI's Responses API with internal instructions to answer only
+   from that context, then parses the model message into an answer string.
 
 ContextIQ uses `gpt-5.6-luna` by default because OpenAI describes it as the
 cost-sensitive GPT-5.6 model and documents support for the Responses API. The
@@ -241,6 +246,61 @@ exposing the internal generation prompt.
 `POST /search` stops after retrieval and returns chunk text for inspecting search
 quality. `POST /ask` performs the same retrieval, augments the prompt with those
 chunks, and returns a concise generated answer plus source metadata.
+
+### LangChain integration
+
+ContextIQ first implemented the complete RAG flow manually so that PDF
+extraction, chunking, embeddings, vector indexing, kNN retrieval, grounding, and
+source attribution stayed visible. LangChain is introduced only after that
+baseline, and only where it removes model-call plumbing without hiding the
+retrieval mechanics.
+
+The generation pipeline uses the focused `langchain-core` and
+`langchain-openai` packages rather than the broader `langchain` package:
+
+```python
+GROUNDING_PROMPT | chat_model | StrOutputParser()
+```
+
+- `ChatPromptTemplate` owns the system grounding instructions and the human
+  question/context placeholders.
+- `ChatOpenAI` is the chat-model adapter. It uses the configured
+  `GENERATION_MODEL`, API key, output-token limit, and OpenAI Responses API.
+- `StrOutputParser` converts the returned AI message into the plain string used
+  by the existing response schema.
+- The LCEL `|` operator composes those pieces into one `Runnable` pipeline,
+  keeping the stages independently testable and leaving room for standard
+  runnable capabilities such as asynchronous, batch, or streaming execution in
+  future phases.
+
+A small adapter converts retrieved ContextIQ chunks into LangChain `Document`
+objects. The chunk text becomes `page_content`; document ID, filename, chunk
+index, and score are retained as metadata. ContextIQ still formats the final
+source blocks itself and still constructs the public `sources` array from its
+own retrieval models, so no embedding vector or internal prompt enters the API
+response.
+
+The boundary is intentionally narrow:
+
+```text
+Manual / framework-independent                 LangChain
+--------------------------------------------   ---------------------------
+PDF extraction and character chunking          ChatPromptTemplate
+OpenAI embedding generation and validation      ChatOpenAI
+Elasticsearch bulk indexing and kNN retrieval   LCEL Runnable composition
+top_k and document_id filtering                 StrOutputParser
+source selection, metadata, and API schemas
+```
+
+`POST /search` remains completely independent of LangChain. It continues to use
+the manual query-embedding and Elasticsearch retriever path, so retrieval
+quality can be inspected separately from answer generation.
+
+See the official LangChain documentation for
+[ChatOpenAI](https://docs.langchain.com/oss/python/integrations/chat/openai),
+[runnable sequences](https://reference.langchain.com/python/langchain-core/runnables/base/RunnableSequence),
+[ChatPromptTemplate](https://reference.langchain.com/python/langchain-core/prompts/chat/ChatPromptTemplate),
+and [StrOutputParser](https://reference.langchain.com/python/langchain-core/output_parsers/string/StrOutputParser).
 
 ### Recreating an empty development index
 

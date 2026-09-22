@@ -1,10 +1,11 @@
-"""Unit tests for grounded context construction and answer generation."""
+"""Unit tests for LangChain context adaptation and answer generation."""
 
-from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from uuid import UUID
 
 import pytest
+from langchain_core.messages import AIMessage
+from langchain_core.runnables import RunnableLambda
 from openai import OpenAIError
 
 from app.rag.embeddings import MissingOpenAIAPIKeyError
@@ -12,9 +13,9 @@ from app.rag.generation import (
     GROUNDING_INSTRUCTIONS,
     GenerationAPIError,
     InvalidGenerationResponseError,
-    build_generation_input,
     build_retrieved_context,
     generate_grounded_answer,
+    to_langchain_documents,
 )
 from app.schemas.search import SemanticSearchResult
 
@@ -32,13 +33,31 @@ def _chunk(*, index: int, text: str, score: float) -> SemanticSearchResult:
     )
 
 
-def test_retrieved_chunks_are_formatted_as_deterministic_context() -> None:
-    context = build_retrieved_context(
+def test_chunks_are_adapted_to_langchain_documents_with_metadata() -> None:
+    documents = to_langchain_documents(
+        [_chunk(index=1, text="AWS Fargate runs containers.", score=0.91)]
+    )
+
+    assert len(documents) == 1
+    assert documents[0].page_content == "AWS Fargate runs containers."
+    assert documents[0].metadata == {
+        "document_id": str(DOCUMENT_ID),
+        "filename": "knowledge.pdf",
+        "chunk_index": 1,
+        "score": 0.91,
+    }
+    assert "embedding" not in documents[0].metadata
+
+
+def test_langchain_documents_are_formatted_as_deterministic_context() -> None:
+    documents = to_langchain_documents(
         [
             _chunk(index=1, text="AWS Fargate runs containers.", score=0.91),
             _chunk(index=2, text="Amazon S3 stores files.", score=0.82),
         ]
     )
+
+    context = build_retrieved_context(documents)
 
     assert context == (
         "[SOURCE 1]\n"
@@ -60,16 +79,23 @@ def test_retrieved_chunks_are_formatted_as_deterministic_context() -> None:
     )
 
 
-@patch("app.rag.generation.OpenAI")
-def test_generation_uses_responses_api_with_question_and_context(
-    openai_class: Mock,
+@patch("app.rag.generation.ChatOpenAI")
+def test_lcel_pipeline_inserts_prompt_values_and_parses_answer(
+    chat_openai: Mock,
 ) -> None:
-    client = openai_class.return_value
-    client.responses.create.return_value = SimpleNamespace(
-        output_text="AWS Fargate runs containers without managed virtual machines."
-    )
+    captured: dict[str, object] = {}
+
+    def respond(prompt_value: object) -> AIMessage:
+        captured["messages"] = prompt_value.to_messages()  # type: ignore[attr-defined]
+        return AIMessage(
+            content="AWS Fargate runs containers without managed virtual machines."
+        )
+
+    chat_openai.return_value = RunnableLambda(respond)
     context = build_retrieved_context(
-        [_chunk(index=1, text="AWS Fargate runs containers.", score=0.91)]
+        to_langchain_documents(
+            [_chunk(index=1, text="AWS Fargate runs containers.", score=0.91)]
+        )
     )
 
     answer = generate_grounded_answer(
@@ -83,21 +109,26 @@ def test_generation_uses_responses_api_with_question_and_context(
     assert answer == (
         "AWS Fargate runs containers without managed virtual machines."
     )
-    client.responses.create.assert_called_once_with(
-        model="gpt-test",
-        instructions=GROUNDING_INSTRUCTIONS,
-        input=build_generation_input(
-            question="Which service runs containers?",
-            context=context,
-        ),
-        max_output_tokens=300,
-    )
-    client.close.assert_called_once_with()
+    chat_openai.assert_called_once()
+    model_arguments = chat_openai.call_args.kwargs
+    assert model_arguments["model"] == "gpt-test"
+    assert model_arguments["api_key"].get_secret_value() == "test-key"
+    assert model_arguments["max_completion_tokens"] == 300
+    assert model_arguments["use_responses_api"] is True
+    assert model_arguments["output_version"] == "responses/v1"
+
+    messages = captured["messages"]
+    assert messages[0].content == GROUNDING_INSTRUCTIONS  # type: ignore[index,union-attr]
+    human_content = messages[1].content  # type: ignore[index,union-attr]
+    assert "QUESTION:\nWhich service runs containers?" in human_content
+    assert "BEGIN RETRIEVED CONTEXT" in human_content
+    assert "AWS Fargate runs containers." in human_content
+    assert "END RETRIEVED CONTEXT" in human_content
 
 
-@patch("app.rag.generation.OpenAI")
-def test_missing_api_key_stops_generation_before_client_creation(
-    openai_class: Mock,
+@patch("app.rag.generation.ChatOpenAI")
+def test_missing_api_key_stops_generation_before_model_creation(
+    chat_openai: Mock,
 ) -> None:
     with pytest.raises(MissingOpenAIAPIKeyError, match="OPENAI_API_KEY"):
         generate_grounded_answer(
@@ -108,13 +139,15 @@ def test_missing_api_key_stops_generation_before_client_creation(
             max_output_tokens=300,
         )
 
-    openai_class.assert_not_called()
+    chat_openai.assert_not_called()
 
 
-@patch("app.rag.generation.OpenAI")
-def test_generation_provider_failure_is_wrapped(openai_class: Mock) -> None:
-    client = openai_class.return_value
-    client.responses.create.side_effect = OpenAIError("request failed")
+@patch("app.rag.generation.ChatOpenAI")
+def test_generation_provider_failure_is_wrapped(chat_openai: Mock) -> None:
+    def fail(_: object) -> str:
+        raise OpenAIError("request failed")
+
+    chat_openai.return_value = RunnableLambda(fail)
 
     with pytest.raises(GenerationAPIError, match="generation failed"):
         generate_grounded_answer(
@@ -125,18 +158,14 @@ def test_generation_provider_failure_is_wrapped(openai_class: Mock) -> None:
             max_output_tokens=300,
         )
 
-    client.close.assert_called_once_with()
-
 
 @pytest.mark.parametrize("output_text", [None, "", "   "])
-@patch("app.rag.generation.OpenAI")
+@patch("app.rag.generation.build_generation_chain")
 def test_empty_or_malformed_generation_result_is_rejected(
-    openai_class: Mock,
+    build_chain: Mock,
     output_text: str | None,
 ) -> None:
-    openai_class.return_value.responses.create.return_value = SimpleNamespace(
-        output_text=output_text
-    )
+    build_chain.return_value.invoke.return_value = output_text
 
     with pytest.raises(InvalidGenerationResponseError, match="empty or malformed"):
         generate_grounded_answer(

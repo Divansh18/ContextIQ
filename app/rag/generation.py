@@ -1,8 +1,14 @@
-"""Grounded context construction and OpenAI answer generation."""
+"""LangChain prompt composition and grounded answer generation."""
 
 from collections.abc import Sequence
 
-from openai import OpenAI, OpenAIError
+from langchain_core.documents import Document
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import Runnable
+from langchain_openai import ChatOpenAI
+from openai import OpenAIError
+from pydantic import SecretStr
 
 from app.rag.embeddings import MissingOpenAIAPIKeyError
 from app.schemas.search import SemanticSearchResult
@@ -20,6 +26,19 @@ If the context does not contain enough information, respond exactly with:
 {INSUFFICIENT_CONTEXT_ANSWER}
 Otherwise, answer the actual question directly and concisely."""
 
+GROUNDING_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        ("system", GROUNDING_INSTRUCTIONS),
+        (
+            "human",
+            "QUESTION:\n{question}\n\n"
+            "BEGIN RETRIEVED CONTEXT\n"
+            "{context}\n"
+            "END RETRIEVED CONTEXT",
+        ),
+    ]
+)
+
 
 class GenerationError(RuntimeError):
     """Base error for answer-generation failures."""
@@ -33,23 +52,43 @@ class InvalidGenerationResponseError(GenerationError):
     """Raised when the generation provider returns no usable answer."""
 
 
-def build_retrieved_context(chunks: Sequence[SemanticSearchResult]) -> str:
-    """Build deterministic, delimited context from retrieved chunks."""
+def to_langchain_documents(
+    chunks: Sequence[SemanticSearchResult],
+) -> list[Document]:
+    """Adapt retrieved ContextIQ chunks to LangChain documents."""
+    return [
+        Document(
+            page_content=chunk.text.strip(),
+            metadata={
+                "document_id": str(chunk.document_id),
+                "filename": chunk.filename,
+                "chunk_index": chunk.chunk_index,
+                "score": chunk.score,
+            },
+        )
+        for chunk in chunks
+        if chunk.text.strip()
+    ]
+
+
+def build_retrieved_context(documents: Sequence[Document]) -> str:
+    """Build deterministic, delimited context from LangChain documents."""
     source_blocks: list[str] = []
-    for chunk in chunks:
-        content = chunk.text.strip()
+    for document in documents:
+        content = document.page_content.strip()
         if not content:
             continue
 
         source_number = len(source_blocks) + 1
+        metadata = document.metadata
         source_blocks.append(
             "\n".join(
                 [
                     f"[SOURCE {source_number}]",
-                    f"document_id: {chunk.document_id}",
-                    f"filename: {chunk.filename}",
-                    f"chunk_index: {chunk.chunk_index}",
-                    f"retrieval_score: {chunk.score:.6f}",
+                    f"document_id: {metadata['document_id']}",
+                    f"filename: {metadata['filename']}",
+                    f"chunk_index: {metadata['chunk_index']}",
+                    f"retrieval_score: {float(metadata['score']):.6f}",
                     "content:",
                     content,
                     f"[/SOURCE {source_number}]",
@@ -60,20 +99,21 @@ def build_retrieved_context(chunks: Sequence[SemanticSearchResult]) -> str:
     return "\n\n".join(source_blocks)
 
 
-def build_generation_input(*, question: str, context: str) -> str:
-    """Combine a question and retrieved context into a stable model input."""
-    normalized_question = question.strip()
-    if not normalized_question:
-        raise ValueError("question must not be empty")
-    if not context.strip():
-        raise ValueError("context must not be empty")
-
-    return (
-        f"QUESTION:\n{normalized_question}\n\n"
-        "BEGIN RETRIEVED CONTEXT\n"
-        f"{context.strip()}\n"
-        "END RETRIEVED CONTEXT"
+def build_generation_chain(
+    *,
+    api_key: str,
+    model: str,
+    max_output_tokens: int,
+) -> Runnable[dict[str, str], str]:
+    """Compose the LangChain prompt, OpenAI model, and string parser."""
+    chat_model = ChatOpenAI(
+        model=model,
+        api_key=SecretStr(api_key),
+        max_completion_tokens=max_output_tokens,
+        use_responses_api=True,
+        output_version="responses/v1",
     )
+    return GROUNDING_PROMPT | chat_model | StrOutputParser()
 
 
 def generate_grounded_answer(
@@ -94,23 +134,28 @@ def generate_grounded_answer(
     if max_output_tokens <= 0:
         raise ValueError("max_output_tokens must be greater than zero")
 
-    generation_input = build_generation_input(question=question, context=context)
-    client: OpenAI | None = None
+    normalized_question = question.strip()
+    normalized_context = context.strip()
+    if not normalized_question:
+        raise ValueError("question must not be empty")
+    if not normalized_context:
+        raise ValueError("context must not be empty")
+
     try:
-        client = OpenAI(api_key=api_key)
-        response = client.responses.create(
+        chain = build_generation_chain(
+            api_key=api_key,
             model=model,
-            instructions=GROUNDING_INSTRUCTIONS,
-            input=generation_input,
             max_output_tokens=max_output_tokens,
+        )
+        output_text = chain.invoke(
+            {
+                "question": normalized_question,
+                "context": normalized_context,
+            }
         )
     except OpenAIError as exc:
         raise GenerationAPIError("OpenAI answer generation failed.") from exc
-    finally:
-        if client is not None:
-            client.close()
 
-    output_text = getattr(response, "output_text", None)
     if not isinstance(output_text, str) or not output_text.strip():
         raise InvalidGenerationResponseError(
             "OpenAI returned an empty or malformed answer."
