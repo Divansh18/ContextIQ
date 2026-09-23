@@ -1,4 +1,4 @@
-"""Unit tests for RAG question-answer orchestration."""
+"""Unit tests for RAG question-answer response orchestration."""
 
 from unittest.mock import Mock, patch
 from uuid import UUID
@@ -24,7 +24,7 @@ def _settings() -> Settings:
     )
 
 
-def _chunk() -> SemanticSearchResult:
+def _chunk(*, score: float = 0.91) -> SemanticSearchResult:
     text = "AWS Fargate runs containers without managing EC2 virtual machines."
     return SemanticSearchResult(
         document_id=DOCUMENT_ID,
@@ -32,41 +32,41 @@ def _chunk() -> SemanticSearchResult:
         chunk_index=1,
         text=text,
         character_count=len(text),
-        score=0.91,
+        score=score,
     )
 
 
-@patch("app.services.question_service.generate_grounded_answer")
-@patch("app.services.question_service.retrieve_semantic_chunks")
-def test_question_service_retrieves_generates_and_preserves_sources(
-    retrieve_chunks: Mock,
-    generate_answer: Mock,
+@patch("app.services.question_service.run_rag_workflow")
+def test_question_service_runs_graph_and_preserves_sources(
+    run_workflow: Mock,
 ) -> None:
-    retrieve_chunks.return_value = [_chunk()]
-    generate_answer.return_value = "Use Amazon ECS with AWS Fargate."
+    chunk = _chunk()
+    run_workflow.return_value = {
+        "question": "Which service runs containers?",
+        "top_k": 2,
+        "document_id": DOCUMENT_ID,
+        "retrieved_chunks": [chunk],
+        "enough_context": True,
+        "answer": "Use Amazon ECS with AWS Fargate.",
+    }
     client = Mock()
+    settings = _settings()
 
     response = answer_question(
         question="  Which service runs containers?  ",
         top_k=2,
         document_id=DOCUMENT_ID,
-        settings=_settings(),
+        settings=settings,
         elasticsearch_client=client,
     )
 
-    retrieve_chunks.assert_called_once_with(
-        query="Which service runs containers?",
+    run_workflow.assert_called_once_with(
+        question="Which service runs containers?",
         top_k=2,
         document_id=DOCUMENT_ID,
-        settings=_settings(),
+        settings=settings,
         elasticsearch_client=client,
     )
-    generation_call = generate_answer.call_args.kwargs
-    assert generation_call["question"] == "Which service runs containers?"
-    assert "AWS Fargate runs containers" in generation_call["context"]
-    assert generation_call["api_key"] == "test-key"
-    assert generation_call["model"] == "gpt-test"
-    assert generation_call["max_output_tokens"] == 250
     assert response.answer == "Use Amazon ECS with AWS Fargate."
     assert response.sources[0].document_id == DOCUMENT_ID
     assert response.sources[0].chunk_index == 1
@@ -74,14 +74,22 @@ def test_question_service_retrieves_generates_and_preserves_sources(
     assert "embedding" not in response.sources[0].model_dump()
 
 
-@patch("app.services.question_service.generate_grounded_answer")
-@patch("app.services.question_service.retrieve_semantic_chunks", return_value=[])
-def test_no_retrieval_results_return_grounded_fallback_without_generation(
-    retrieve_chunks: Mock,
-    generate_answer: Mock,
+@patch("app.services.question_service.run_rag_workflow")
+def test_fallback_preserves_weak_retrieval_sources(
+    run_workflow: Mock,
 ) -> None:
+    weak_chunk = _chunk(score=0.52)
+    run_workflow.return_value = {
+        "question": "What is the capital of France?",
+        "top_k": 3,
+        "document_id": None,
+        "retrieved_chunks": [weak_chunk],
+        "enough_context": False,
+        "answer": INSUFFICIENT_CONTEXT_ANSWER,
+    }
+
     response = answer_question(
-        question="What is not in the documents?",
+        question="What is the capital of France?",
         top_k=3,
         document_id=None,
         settings=_settings(),
@@ -89,30 +97,24 @@ def test_no_retrieval_results_return_grounded_fallback_without_generation(
     )
 
     assert response.answer == INSUFFICIENT_CONTEXT_ANSWER
-    assert response.sources == []
-    generate_answer.assert_not_called()
+    assert [source.chunk_index for source in response.sources] == [1]
+    assert response.sources[0].score == pytest.approx(0.52)
 
 
-@patch("app.services.question_service.generate_grounded_answer")
-@patch("app.services.question_service.retrieve_semantic_chunks")
-def test_empty_retrieved_context_returns_grounded_fallback(
-    retrieve_chunks: Mock,
-    generate_answer: Mock,
-) -> None:
-    retrieve_chunks.return_value = [
-        SemanticSearchResult(
-            document_id=DOCUMENT_ID,
-            filename="empty.pdf",
-            chunk_index=0,
-            text=" ",
-            character_count=1,
-            score=0.2,
-        )
-    ]
+@patch("app.services.question_service.run_rag_workflow")
+def test_empty_retrieval_returns_no_sources(run_workflow: Mock) -> None:
+    run_workflow.return_value = {
+        "question": "Question",
+        "top_k": None,
+        "document_id": None,
+        "retrieved_chunks": [],
+        "enough_context": False,
+        "answer": INSUFFICIENT_CONTEXT_ANSWER,
+    }
 
     response = answer_question(
-        question="What is not in the documents?",
-        top_k=3,
+        question="Question",
+        top_k=None,
         document_id=None,
         settings=_settings(),
         elasticsearch_client=Mock(),
@@ -120,17 +122,11 @@ def test_empty_retrieved_context_returns_grounded_fallback(
 
     assert response.answer == INSUFFICIENT_CONTEXT_ANSWER
     assert response.sources == []
-    generate_answer.assert_not_called()
 
 
-@patch("app.services.question_service.generate_grounded_answer")
-@patch("app.services.question_service.retrieve_semantic_chunks")
-def test_generation_failure_is_not_swallowed(
-    retrieve_chunks: Mock,
-    generate_answer: Mock,
-) -> None:
-    retrieve_chunks.return_value = [_chunk()]
-    generate_answer.side_effect = GenerationAPIError("generation failed")
+@patch("app.services.question_service.run_rag_workflow")
+def test_workflow_failure_is_not_swallowed(run_workflow: Mock) -> None:
+    run_workflow.side_effect = GenerationAPIError("generation failed")
 
     with pytest.raises(GenerationAPIError, match="generation failed"):
         answer_question(

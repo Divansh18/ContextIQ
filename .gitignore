@@ -12,6 +12,14 @@ venv/
 # Local configuration
 .env
 
+# Next.js frontend
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/.env*.local
+frontend/next-env.d.ts
+frontend/*.tsbuildinfo
+
 # Packaging output
 build/
 dist/
@@ -21,4 +29,3 @@ dist/
 .idea/
 .vscode/
 .DS_Store
-

@@ -13,6 +13,7 @@ MAX_SEARCH_TOP_K = 100
 DEFAULT_SEARCH_NUM_CANDIDATES_MULTIPLIER = 10
 DEFAULT_GENERATION_MODEL = "gpt-5.6-luna"
 DEFAULT_GENERATION_MAX_OUTPUT_TOKENS = 300
+DEFAULT_RAG_RELEVANCE_THRESHOLD = 0.60
 MAX_ELASTICSEARCH_NUM_CANDIDATES = 10_000
 MAX_ELASTICSEARCH_EMBEDDING_DIMENSIONS = 4_096
 
@@ -39,6 +40,10 @@ class Settings(BaseSettings):
 
     app_name: str = "ContextIQ"
     app_version: str = "0.1.0"
+    frontend_origin: str = Field(
+        default="http://localhost:3000",
+        min_length=1,
+    )
     preview_character_limit: int = Field(default=200, ge=1, le=2_000)
     chunk_size: int = Field(default=DEFAULT_CHUNK_SIZE, gt=0)
     chunk_overlap: int = Field(default=DEFAULT_CHUNK_OVERLAP, ge=0)
@@ -93,6 +98,11 @@ class Settings(BaseSettings):
         default=DEFAULT_GENERATION_MAX_OUTPUT_TOKENS,
         ge=1,
         le=4_000,
+    )
+    rag_relevance_threshold: float = Field(
+        default=DEFAULT_RAG_RELEVANCE_THRESHOLD,
+        ge=0.0,
+        le=1.0,
     )
 
     @model_validator(mode="after")

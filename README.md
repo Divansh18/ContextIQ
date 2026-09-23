@@ -1,10 +1,10 @@
 # ContextIQ
 
 ContextIQ is a lightweight knowledge assistant built incrementally to demonstrate
-a clean retrieval-augmented generation (RAG) architecture. The current backend
-ingests PDFs, embeds their chunks, stores them in Elasticsearch, and retrieves
-semantically related passages before generating grounded answers through
-FastAPI.
+a clean retrieval-augmented generation (RAG) architecture. The backend ingests
+PDFs, embeds their chunks, stores them in Elasticsearch, and retrieves
+semantically related passages before generating grounded answers. A minimal
+Next.js interface makes that FastAPI workflow easy to demonstrate.
 
 ## Current capabilities
 
@@ -18,13 +18,17 @@ FastAPI.
 - Semantic vector search across all documents or within one document
 - Grounded answer generation with retrieved source metadata and a focused
   LangChain LCEL pipeline
+- Conditional LangGraph orchestration with deterministic weak-context fallback
+- Document-scoped Next.js upload and grounded-question workspace
 - Separate application liveness and Elasticsearch readiness checks
 - Environment-backed application configuration
 - API tests
 
-LangGraph, authentication, and a frontend are intentionally deferred to later
-milestones. LangChain is used only at the answer-generation boundary described
-below; ingestion, indexing, and retrieval remain explicit application code.
+Authentication and persistent user sessions are intentionally deferred to later
+milestones. LangChain is used only at the answer-generation boundary, while
+LangGraph orchestrates retrieval, evidence evaluation, and conditional routing.
+Ingestion, indexing, and retrieval implementations remain explicit application
+code.
 
 ## Architecture
 
@@ -37,6 +41,11 @@ app/
 ├── services/               # Application and document-processing logic
 └── rag/                    # Chunking, embeddings, retrieval, and generation
 tests/                      # API tests
+frontend/
+├── app/                    # Next.js App Router page and global styles
+├── components/             # Upload, question, answer, and source UI
+├── lib/                    # Typed backend API client
+└── types/                  # FastAPI contract types
 ```
 
 The document upload flow is deliberately one-directional:
@@ -65,18 +74,24 @@ The grounded answer flow builds directly on semantic search:
 ```text
 POST /ask
   -> question service
-  -> semantic retriever                         (ContextIQ)
-  -> ranked document chunks                     (ContextIQ)
-  -> LangChain Document adapter + source blocks (ContextIQ)
-  -> ChatPromptTemplate                         (LangChain)
-  -> ChatOpenAI via the Responses API           (LangChain)
-  -> StrOutputParser                            (LangChain)
-  -> answer plus source metadata                (ContextIQ)
+  -> LangGraph retrieve node
+  -> existing semantic retriever                 (ContextIQ)
+  -> LangGraph evaluate-context node
+  -> best score >= configured threshold?
+       |-- yes -> generate node
+       |          -> ChatPromptTemplate          (LangChain)
+       |          -> ChatOpenAI                  (LangChain)
+       |          -> StrOutputParser             (LangChain)
+       |
+       `-- no  -> deterministic fallback node    (no model call)
+  -> answer plus source metadata                 (ContextIQ)
 ```
 
 ## Requirements
 
 - Python 3.11 or newer
+- Node.js 20.9 or newer
+- Docker for local Elasticsearch
 
 ## Local setup
 
@@ -98,11 +113,34 @@ CONTEXTIQ_SEARCH_DEFAULT_TOP_K=3
 CONTEXTIQ_SEARCH_NUM_CANDIDATES_MULTIPLIER=10
 GENERATION_MODEL=gpt-5.6-luna
 CONTEXTIQ_GENERATION_MAX_OUTPUT_TOKENS=300
+CONTEXTIQ_RAG_RELEVANCE_THRESHOLD=0.60
+CONTEXTIQ_FRONTEND_ORIGIN=http://localhost:3000
 ```
 
 Never commit `.env`; it is excluded by `.gitignore`. The API can start without
 an OpenAI key, but uploads containing extractable text, semantic searches, and
-answer generation return a clear configuration error until one is supplied.
+`/ask` requests that reach generation return a clear configuration error until
+one is supplied. A weak-retrieval `/ask` request can take the deterministic
+fallback branch without calling the generation model.
+
+Install the frontend dependencies and create its local environment file:
+
+```bash
+cd frontend
+npm install
+cp .env.example .env.local
+```
+
+The browser-visible backend URL is configured separately in
+`frontend/.env.local`:
+
+```dotenv
+NEXT_PUBLIC_API_BASE_URL=http://localhost:8000
+```
+
+`CONTEXTIQ_FRONTEND_ORIGIN` controls the one browser origin FastAPI permits for
+cross-origin requests. It defaults to `http://localhost:3000`; wildcard origins
+are not enabled.
 
 ## Elasticsearch
 
@@ -215,16 +253,16 @@ uploaded files even when the wording differs.
 
 ### Retrieval-augmented generation
 
-RAG has three direct stages in ContextIQ:
+RAG has three direct stages in ContextIQ, coordinated by a conditional graph:
 
 1. **Retrieval:** the existing semantic retriever embeds the question and asks
    Elasticsearch for the nearest chunks.
 2. **Augmentation:** ContextIQ formats those chunks into deterministic,
    clearly delimited `[SOURCE n]` blocks containing document metadata, retrieval
    score, and source text.
-3. **Generation:** a focused LangChain pipeline sends the question and source
-   blocks to OpenAI's Responses API with internal instructions to answer only
-   from that context, then parses the model message into an answer string.
+3. **Routing and generation:** a retrieval-score gate either sends the source
+   blocks through the focused LangChain pipeline or returns the deterministic
+   insufficient-context answer without a generation call.
 
 ContextIQ uses `gpt-5.6-luna` by default because OpenAI describes it as the
 cost-sensitive GPT-5.6 model and documents support for the Responses API. The
@@ -238,10 +276,10 @@ insufficient. Grounding reduces hallucination risk by limiting the evidence
 available to the generation step, although application-level evaluation remains
 important for any production use.
 
-Every retrieved chunk used as context is represented in the API response by its
-`document_id`, filename, chunk index, and retrieval score. This makes the answer
-traceable to its supporting source without returning chunk embeddings or
-exposing the internal generation prompt.
+Every usable retrieved chunk is represented in the API response by its
+`document_id`, filename, chunk index, and retrieval score—even when weak
+evidence routes to the fallback. This preserves retrieval visibility without
+returning chunk embeddings or exposing the internal generation prompt.
 
 `POST /search` stops after retrieval and returns chunk text for inspecting search
 quality. `POST /ask` performs the same retrieval, augments the prompt with those
@@ -280,7 +318,7 @@ source blocks itself and still constructs the public `sources` array from its
 own retrieval models, so no embedding vector or internal prompt enters the API
 response.
 
-The boundary is intentionally narrow:
+The LangChain boundary is intentionally narrow:
 
 ```text
 Manual / framework-independent                 LangChain
@@ -301,6 +339,77 @@ See the official LangChain documentation for
 [runnable sequences](https://reference.langchain.com/python/langchain-core/runnables/base/RunnableSequence),
 [ChatPromptTemplate](https://reference.langchain.com/python/langchain-core/prompts/chat/ChatPromptTemplate),
 and [StrOutputParser](https://reference.langchain.com/python/langchain-core/output_parsers/string/StrOutputParser).
+
+### LangGraph conditional workflow
+
+The Phase 6 LangChain pipeline was deliberately linear: once context existed,
+the application formatted a prompt, called one model, and parsed one answer. A
+graph would not have improved that sequence by itself. LangGraph is introduced
+now because ContextIQ has a real branch: strong retrieval evidence proceeds to
+generation, while weak or empty retrieval returns a deterministic fallback and
+avoids an unnecessary model call.
+
+The graph carries a small typed state containing only:
+
+- the normalized question, requested `top_k`, and optional `document_id`
+- retrieved ContextIQ chunks
+- the `enough_context` routing decision
+- the final answer
+
+Settings and the Elasticsearch client are passed through LangGraph's run-scoped
+context and are never put in graph state. The graph is compiled once, while
+those dependencies can vary per invocation. Graph internals are also absent
+from the public API response.
+
+```text
+START
+  |
+  v
+retrieve -- existing embedding + Elasticsearch kNN retriever
+  |
+  v
+evaluate_context -- compare best retrieval score with configured threshold
+  |
+  +-- sufficient --> generate -- existing LangChain LCEL pipeline --> END
+  |
+  `-- insufficient -> fallback -- deterministic answer, no model call --> END
+```
+
+The nodes have focused responsibilities:
+
+1. `retrieve` delegates to the existing framework-independent semantic
+   retriever and records usable chunks in state.
+2. `evaluate_context` compares the best chunk score with
+   `CONTEXTIQ_RAG_RELEVANCE_THRESHOLD`.
+3. A LangGraph conditional edge chooses `generate` or `fallback`.
+4. `generate` reuses the existing `ChatPromptTemplate | ChatOpenAI |
+   StrOutputParser` pipeline; `fallback` returns the existing fixed
+   insufficient-context answer.
+
+The default threshold is `0.60`, and equality is considered sufficient. That
+value conservatively separates the current known relevant examples (about
+`0.62` for S3 and `0.75` for ECS/Fargate) from the unrelated France example
+(about `0.52`). It is only a project-level heuristic—not a universal relevance
+score. Elasticsearch scores depend on the embedding model, index contents, and
+dataset, so this threshold must be evaluated and tuned on a larger
+representative set before production use.
+
+Responsibility boundaries remain explicit:
+
+```text
+Framework-independent          LangChain                 LangGraph
+----------------------------   -----------------------   ----------------------
+PDF extraction and chunking    ChatPromptTemplate        typed workflow state
+embedding and bulk indexing    ChatOpenAI                node orchestration
+Elasticsearch kNN retrieval    LCEL generation chain     relevance evaluation
+filters and source metadata    StrOutputParser           conditional routing
+```
+
+`POST /search` does not invoke LangGraph or LangChain. It remains the direct way
+to inspect the underlying manual semantic retrieval behavior. See the official
+LangGraph documentation for the
+[Graph API and conditional edges](https://docs.langchain.com/oss/python/langgraph/graph-api)
+and [`StateGraph` reference](https://reference.langchain.com/python/langgraph/graph/state/StateGraph).
 
 ### Recreating an empty development index
 
@@ -339,6 +448,37 @@ uvicorn app.main:app --reload
 ```
 
 The API is available at `http://127.0.0.1:8000`, and its interactive documentation is at `http://127.0.0.1:8000/docs`.
+
+## Run the frontend
+
+In a second terminal, with FastAPI and Elasticsearch already running:
+
+```bash
+cd frontend
+npm run dev
+```
+
+Open `http://localhost:3000`. The local services use these ports:
+
+| Service | URL | Purpose |
+|---|---|---|
+| Next.js | `http://localhost:3000` | Browser interface |
+| FastAPI | `http://localhost:8000` | Upload, search, and answer APIs |
+| Elasticsearch | `http://localhost:9200` | Local vector index |
+
+### End-to-end usage
+
+1. Start Elasticsearch with `docker compose up -d elasticsearch`.
+2. Start FastAPI with `uvicorn app.main:app --reload`.
+3. Start Next.js from `frontend/` with `npm run dev`.
+4. Open the frontend and choose a PDF.
+5. Select **Upload & index** and wait for the indexed document summary.
+6. Ask a question. The frontend automatically includes that upload's
+   `document_id`, keeping retrieval scoped to the active PDF.
+7. Review the answer, chunk indexes, filenames, and rounded retrieval scores.
+
+The deterministic insufficient-context response is displayed as a normal
+answer. Embeddings and internal LangGraph state are never displayed.
 
 ## Example requests
 
@@ -429,4 +569,12 @@ those values. The overlap must always be smaller than the chunk size.
 
 ```bash
 pytest
+```
+
+Frontend quality checks run from `frontend/`:
+
+```bash
+npm run lint
+npm run typecheck
+npm run build
 ```
